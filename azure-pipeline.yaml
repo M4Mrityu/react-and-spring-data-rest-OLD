@@ -1,0 +1,130 @@
+trigger:
+  branches:
+    include: 
+    - main
+variables:
+  buildConfiguration: 'Release'
+  location: 'West Europe'
+  acrHostName: 'mywebappdocker002acr.azurecr.io'
+  acrName: 'Mywebappdocker002acr'
+  rgName: 'Docker_App'
+  imageName: 'Mywebappdocker002'
+  webAppName: 'Mywebappdocker002'
+
+stages:
+
+# Build Stage
+- stage: BuildAndTest
+  jobs:
+  - job: BuildAndTest
+    pool:
+      vmImage: 'Ubuntu-16.04'
+    steps:
+
+    # Create or update the ACR resource
+    - task: AzureResourceGroupDeployment@2
+      displayName: 'Azure Deployment:Create Azure Container Registry'
+      inputs:
+        azureSubscription: 'ACRsc'
+        resourceGroupName: '$(rgName)'
+        location: $(location)
+        csmFile: '$(System.DefaultWorkingDirectory)/**/containerRegistry-template.json'
+        overrideParameters: '-registryName "$(acrName)" -registryLocation "$(location)" -registrySku standard'
+
+   
+    - task: Maven@3
+      inputs:
+        mavenPomFile: 'pom.xml'
+        mavenOptions: '-Xmx3072m'
+        javaHomeOption: 'JDKVersion'
+        jdkVersionOption: '1.11'
+        jdkArchitectureOption: 'x64'
+        publishJUnitResults: false
+        goals: 'package'  
+
+    - task: CopyFiles@2
+      displayName: 'Copy Files to artifact staging directory'
+      inputs:
+        SourceFolder: '$(System.DefaultWorkingDirectory)'
+        Contents: '**/target/*.?(war|jar)'
+        TargetFolder: $(Build.ArtifactStagingDirectory)
+    
+   
+    # Publish the app
+    - task: Maven@3
+      displayName: 'Java publish'
+      inputs:
+        command: publish
+        publishWebProjects: True
+        arguments: '--configuration $(BuildConfiguration) --output $(System.DefaultWorkingDirectory)/PublishedWebApp'
+        zipAfterPublish: false
+
+    # Build container image
+    - task: Docker@1
+      displayName: 'Build container image'
+      inputs:
+        azureSubscriptionEndpoint: 'ACRsc'
+        azureContainerRegistry: '$(acrHostName)'
+        imageName: '$(imageName):$(Build.BuildId)'
+
+    # Push container image
+    - task: Docker@1
+      displayName: 'Push container image'
+      inputs:   
+        azureSubscriptionEndpoint: 'ACRsc'    
+        azureContainerRegistry: '$(acrHostName)'        
+       # repository: '$(imageName)'
+        command: 'Push an image'
+        #tag: $(Build.BuildId)
+        imageName: '$(imageName):$(Build.BuildId)'
+        #imageName: '$(acrHostName)/$(imageName):$(Build.BuildId)'   
+
+      # Copy ARM templates
+    - task: CopyFiles@2
+      displayName: 'Copy ARM templates'
+      inputs:
+        SourceFolder: ARM Templates
+        TargetFolder: '$(build.artifactstagingdirectory)'
+
+    # Publish the app as an artifact
+    - publish: $(Build.StagingDirectory)
+      artifact: app
+
+# Staging release
+- stage: Staging
+  jobs:
+  - job: Release
+    pool:
+      vmImage: 'Ubuntu-16.04'
+    steps:
+    # Don't clone the repo
+    - checkout: none
+
+    # Download the published application artifact
+    - download: current
+      artifact: app
+
+    # Create or update Azure App Service
+    - task: AzureResourceGroupDeployment@2
+      displayName: 'Azure Deployment:Create Azure App Service'
+      inputs:
+        azureSubscription: 'ACRsc'
+        resourceGroupName: '$(rgName)'
+        location: '$(location)'
+        csmFile: '$(Pipeline.Workspace)/**/container-webapp-template.json'
+        overrideParameters: '-webAppName $(webAppName) -hostingPlanName $(webAppName) -appInsightsLocation "$(location)" -sku "S1 Standard" -registryName $(acrName) -registryLocation "$(location)" -registrySku standard -imageName $(imageName):$(Build.BuildId)'
+
+    # Deploy App Service
+    - task: AzureRmWebAppDeployment@3
+      displayName: 'Deploy Azure App Service'
+      inputs:
+        azureSubscription: 'ACRsc'
+        appType: applinux
+        WebAppName: $(webAppName)
+        DockerNamespace: $(acrHostName)
+        DockerRepository: $(webAppName)
+        DockerImageTag: '$(Build.BuildId)'
+        WebAppUri: webAppUrl
+        TakeAppOfflineFlag: true
+        UseWebDeploy: true
+        RenameFilesFlag: true
